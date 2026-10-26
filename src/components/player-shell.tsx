@@ -28,6 +28,8 @@ import {
   DESKTOP_CONTROL_HIDE_MS,
   TOUCH_CONTROL_HIDE_MS,
 } from '@/lib/control-hide';
+import type { DanmakuItem, DanmakuStyle } from '@/lib/danmaku';
+import { DanmakuLayer } from './danmaku-layer';
 
 /** 片段时间统一保留 1 位小数：与面板展示保持一致，避免浮点尾巴 */
 const round1 = (v: number) => Math.round(v * 10) / 10;
@@ -97,6 +99,14 @@ interface PlayerShellProps {
   onNextEpisode?: () => void;
   hasPrevEpisode?: boolean;
   hasNextEpisode?: boolean;
+  /** 本集弹幕（时间轴已由页面层施加偏移；换集时整批替换） */
+  danmakuItems: DanmakuItem[];
+  /** 弹幕样式子集（透明度/字号/速度/区域/三类显示开关） */
+  danmakuOptions: DanmakuStyle;
+  /** 弹幕是否可见：false 时不渲染覆盖层内容（但引擎仍在，切回来无需重建） */
+  danmakuVisible: boolean;
+  /** seek 后回调：页面层可据此做自己的游标/缓存处理（可选，不传也不影响弹幕） */
+  onDanmakuSeek?: () => void;
 }
 
 export function PlayerShell({
@@ -123,6 +133,10 @@ export function PlayerShell({
   onNextEpisode,
   hasPrevEpisode,
   hasNextEpisode,
+  danmakuItems,
+  danmakuOptions,
+  danmakuVisible,
+  onDanmakuSeek,
 }: PlayerShellProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -130,6 +144,11 @@ export function PlayerShell({
   const hlsRef = useRef<Hls | null>(null);
   const [error, setError] = useState('');
   const [hint, setHint] = useState('');
+  // 弹幕覆盖层要挂在 <video> 上：ArtPlayer 实例只在挂载时创建一次，
+  // video 元素因此也必须用 state 传下去（换集不重建，video 也不会换）
+  const [videoEl, setVideoEl] = useState<HTMLVideoElement | null>(null);
+  // 网页全屏状态：播放器根节点此时被改成 fixed，弹幕覆盖层要跟着换定位
+  const [webFullscreen, setWebFullscreen] = useState(false);
   // 起播前的品牌占位图（沿用旧版 nomedia 素材），实际开始播放后隐藏
   const [showPoster, setShowPoster] = useState(true);
   const hintTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -141,6 +160,7 @@ export function PlayerShell({
     episodeKey, nextUrl, nextEpisodeKey,
     getRestorePosition, onTimeUpdate, onEnded, onPause, onQuality, onRequestSwitchSource,
     onPrevEpisode, onNextEpisode, hasPrevEpisode, hasNextEpisode,
+    danmakuItems, danmakuOptions, danmakuVisible, onDanmakuSeek,
   });
   propsRef.current = {
     url, title, adFilter, autoplayNext, skipMark, autoSkipSegments,
@@ -148,6 +168,7 @@ export function PlayerShell({
     episodeKey, nextUrl, nextEpisodeKey,
     getRestorePosition, onTimeUpdate, onEnded, onPause, onQuality, onRequestSwitchSource,
     onPrevEpisode, onNextEpisode, hasPrevEpisode, hasNextEpisode,
+    danmakuItems, danmakuOptions, danmakuVisible, onDanmakuSeek,
   };
 
   /** 上报实测画质：多次上报取大值由调用方决定，这里只管把拿到的高度传出去 */
@@ -563,6 +584,8 @@ export function PlayerShell({
       },
     });
     artRef.current = art;
+    // 弹幕引擎以 video 为时间轴，覆盖层拿到 video 才能算出「现在该画哪一条」
+    setVideoEl(art.video ?? null);
 
     // 进度条区间可视化：初始渲染一次，换集 duration 变化时重绘
     renderSkipMarks();
@@ -571,6 +594,22 @@ export function PlayerShell({
     art.on('fullscreen', renderSkipMarks);
     art.on('fullscreenWeb', renderSkipMarks);
     art.on('resize', renderSkipMarks);
+    // 网页全屏会把播放器根节点改成 fixed + z-index 9999，覆盖层必须跟着换定位，
+    // 否则会留在原来的小盒子里被整块盖住（见 DanmakuLayer 的注释）
+    art.on('fullscreenWeb', (state: boolean) => setWebFullscreen(Boolean(state)));
+
+    /**
+     * 原生全屏会让弹幕消失：全屏态下浏览器只渲染 <video> 元素本身，
+     * 挂在文档流里的 Canvas 覆盖层被整个裁掉——这是「外挂」方案无法绕过的限制
+     * （除非把弹幕画进 video 的帧缓冲，那需要转码/自定义 MSE，代价远大于收益）。
+     * 因此弹幕可见时把原生全屏换成网页全屏：同样铺满视口，但 DOM 仍在，覆盖层照常绘制。
+     */
+    art.on('fullscreen', (state: boolean) => {
+      if (!state || !propsRef.current.danmakuVisible) return;
+      art.fullscreenWeb = true;
+      art.fullscreen = false;
+      showHint('弹幕开启时使用网页全屏');
+    });
 
     // 播放页「记录当前」需要精确时间：不能依赖 5s 节流的 onTimeUpdate
     propsRef.current.onPlayerApi?.({
@@ -708,6 +747,9 @@ export function PlayerShell({
     });
     art.on('video:seeked', () => {
       ensurePrefetch(currentMediaUrlRef.current, art.currentTime);
+      // 弹幕引擎自己监听 video 的 seeking/seeked 复位游标，这里只是把 seek 事件
+      // 透出去，供页面层做（可选的）额外处理
+      propsRef.current.onDanmakuSeek?.();
       // seek 是用户主动行为：拉平采样基准，避免下一拍被误判为「连续越过片尾」。
       // 暂停中 seek 不会触发 timeupdate，这里也同步刷新按钮的显隐。
       const current = art.currentTime;
@@ -915,6 +957,8 @@ export function PlayerShell({
       getVideoPrefetcher().stop();
       // 播放页可能仍持有读取接口：销毁前显式置空，避免「记录当前」读到已销毁实例
       propsRef.current.onPlayerApi?.(null);
+      // 弹幕覆盖层先卸载（引擎内部还持着 video 引用），再销毁播放器
+      setVideoEl(null);
       art.destroy();
       artRef.current = null;
     };
@@ -976,9 +1020,20 @@ export function PlayerShell({
   return (
     <div className="relative w-full h-full">
       <div ref={containerRef} className="w-full h-full" style={{ WebkitTouchCallout: 'none' }} />
+      {/* 覆盖层放在 ArtPlayer 容器之后，z-index 20（高于 .art-video 的 10、低于 .art-bottom 的 60），
+          且 pointer-events:none，保证「看得到弹幕、点得到播放器」 */}
+      <DanmakuLayer
+        video={videoEl}
+        items={danmakuItems}
+        options={danmakuOptions}
+        visible={danmakuVisible}
+        fullscreen={webFullscreen}
+      />
       {showPoster && !error && (
         <div
-          className="absolute inset-0 bg-black pointer-events-none"
+          // z-[25]：盖住弹幕覆盖层（z-20）。换源/换集时画面回到占位图，
+          // 若覆盖层还留着上一集的最后一帧，弹幕会飘在黑底海报上
+          className="absolute inset-0 z-[25] bg-black pointer-events-none"
           style={{
             backgroundImage: 'url(/player-poster.png)',
             backgroundSize: 'contain',
@@ -990,7 +1045,7 @@ export function PlayerShell({
       {!error && skipPrompt && (
         <button
           type="button"
-          className="absolute bottom-16 left-1/2 -translate-x-1/2 z-10 rounded-full bg-black/70 px-4 py-2 text-sm text-white transition-colors hover:bg-black/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+          className="absolute bottom-16 left-1/2 -translate-x-1/2 z-30 rounded-full bg-black/70 px-4 py-2 text-sm text-white transition-colors hover:bg-black/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
           onClick={() => {
             if (skipPrompt.type === 'ending') {
               finishBySkip(skipPrompt);
@@ -1013,7 +1068,7 @@ export function PlayerShell({
         </button>
       )}
       {error && (
-        <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 bg-black/80">
+        <div className="absolute inset-0 z-30 flex flex-col items-center justify-center gap-2 bg-black/80">
           <p className="text-danger text-sm">{error}</p>
           <button className="btn-ghost text-xs" onClick={() => location.reload()}>
             重新加载
@@ -1021,7 +1076,9 @@ export function PlayerShell({
         </div>
       )}
       {(hint || undoSkip) && (
-        <div className="absolute top-4 left-1/2 -translate-x-1/2 z-10 flex items-center gap-2 rounded-full bg-black/70 px-3 py-1.5 text-sm text-white animate-fade-in">
+        // 提示层必须高于弹幕覆盖层（z-20）：跳过提示/撤销是操作入口，
+        // 被飘过的弹幕盖住会影响阅读
+        <div className="absolute top-4 left-1/2 -translate-x-1/2 z-30 flex items-center gap-2 rounded-full bg-black/70 px-3 py-1.5 text-sm text-white animate-fade-in">
           {/* 撤销窗口比普通提示长：hint 已淡出时仍要让用户知道刚才跳过了什么 */}
           <span className="pointer-events-none">
             {hint || (undoSkip ? `已跳过${SEGMENT_LABELS[undoSkip.segment.type]}` : '')}
