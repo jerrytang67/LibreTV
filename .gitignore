@@ -11,4 +11,5 @@ vitest-results.json
 .mimosa/
 .zcode/
 .codebuddy/
+.workbuddy/
 generated-images/
