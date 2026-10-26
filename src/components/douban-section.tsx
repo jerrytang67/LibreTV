@@ -12,7 +12,7 @@ const MOVIE_TAGS = ['热门', '最新', '经典', '豆瓣高分', '冷门佳片'
 const TV_TAGS = ['热门', '美剧', '英剧', '韩剧', '日剧', '国产剧', '港剧', '日本动画', '综艺', '纪录片'];
 const WEEKDAYS = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'];
 
-/** 首页推荐区：数据源由设置决定（豆瓣热门 / Bangumi 新番放送 / 影视热榜），二选一展示 */
+/** 首页推荐区：数据源由设置决定（豆瓣热门 / Bangumi 新番放送 / 影视热榜 / 豆瓣高分 / B站影视榜 / AniList 动漫趋势 / TVMaze 欧美剧排期），择一展示 */
 export function RecommendSection({ onPick }: { onPick: (title: string) => void }) {
   const doubanEnabled = useAppStore((s) => s.doubanEnabled);
   const recommendSource = useAppStore((s) => s.recommendSource);
@@ -20,6 +20,10 @@ export function RecommendSection({ onPick }: { onPick: (title: string) => void }
   if (!doubanEnabled) return null;
   if (recommendSource === 'bangumi') return <BangumiView onPick={onPick} />;
   if (recommendSource === 'hot-list') return <HotListView onPick={onPick} />;
+  if (recommendSource === 'douban-top250') return <DoubanTop250View onPick={onPick} />;
+  if (recommendSource === 'bili') return <BiliView onPick={onPick} />;
+  if (recommendSource === 'anilist') return <AniListView onPick={onPick} />;
+  if (recommendSource === 'tvmaze') return <TvmazeView onPick={onPick} />;
   return <DoubanView onPick={onPick} />;
 }
 
@@ -192,6 +196,136 @@ function GridSkeleton() {
         </div>
       ))}
     </div>
+  );
+}
+
+/** 新推荐源通用列表区块：错误 / 加载 / 空 / 卡片网格四种状态 */
+function SimpleListView({
+  ariaLabel,
+  items,
+  isError,
+  isLoading,
+  onPick,
+  emptyText = '暂无推荐内容',
+}: {
+  ariaLabel: string;
+  items: DoubanItem[];
+  isError: boolean;
+  isLoading: boolean;
+  onPick: (title: string) => void;
+  emptyText?: string;
+}) {
+  return (
+    <section aria-label={ariaLabel}>
+      {isError ? (
+        <p className="text-center text-sm text-faint py-8">推荐内容加载失败，可稍后重试或在设置中关闭</p>
+      ) : isLoading ? (
+        <GridSkeleton />
+      ) : items.length === 0 ? (
+        <p className="text-center text-sm text-faint py-8">{emptyText}</p>
+      ) : (
+        <div className="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-6 lg:grid-cols-8 gap-2.5">
+          {items.map((item) => (
+            <DoubanCard key={item.id} item={item} onClick={() => onPick(item.title)} />
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+/** 豆瓣高分电影榜（豆瓣电影 Top250，单榜无筛选） */
+function DoubanTop250View({ onPick }: { onPick: (title: string) => void }) {
+  const query = useQuery({
+    queryKey: ['douban-top250'],
+    queryFn: ({ signal }) => api.doubanTop250(signal),
+  });
+
+  return (
+    <SimpleListView
+      ariaLabel="豆瓣高分推荐"
+      items={query.data?.items ?? []}
+      isError={query.isError}
+      isLoading={query.isLoading}
+      onPick={onPick}
+    />
+  );
+}
+
+const BILI_LISTS = [
+  { rid: 23, label: '影视榜' },
+  { rid: 5, label: '电视剧榜' },
+];
+
+/** B站影视榜：影视区 / 电视剧区排行，chips 切换 */
+function BiliView({ onPick }: { onPick: (title: string) => void }) {
+  const [rid, setRid] = useState(BILI_LISTS[0].rid);
+
+  const query = useQuery({
+    queryKey: ['bili-ranking', rid],
+    queryFn: ({ signal }) => api.biliRanking(rid, signal),
+  });
+
+  const items = query.data?.items ?? [];
+
+  return (
+    <section aria-label="B站影视榜推荐">
+      <div className="flex flex-wrap gap-1.5 mb-4">
+        {BILI_LISTS.map((l) => (
+          <ChipButton key={l.rid} active={rid === l.rid} onClick={() => setRid(l.rid)}>
+            {l.label}
+          </ChipButton>
+        ))}
+      </div>
+
+      {query.isError ? (
+        <p className="text-center text-sm text-faint py-8">推荐内容加载失败，可稍后重试或在设置中关闭</p>
+      ) : query.isLoading ? (
+        <GridSkeleton />
+      ) : (
+        <div className="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-6 lg:grid-cols-8 gap-2.5">
+          {items.map((item) => (
+            <DoubanCard key={item.id} item={item} onClick={() => onPick(item.title)} />
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+/** AniList 动漫趋势榜（单榜无筛选） */
+function AniListView({ onPick }: { onPick: (title: string) => void }) {
+  const query = useQuery({
+    queryKey: ['anilist-trending'],
+    queryFn: ({ signal }) => api.anilistTrending(signal),
+  });
+
+  return (
+    <SimpleListView
+      ariaLabel="动漫趋势推荐"
+      items={query.data?.items ?? []}
+      isError={query.isError}
+      isLoading={query.isLoading}
+      onPick={onPick}
+    />
+  );
+}
+
+/** TVMaze 欧美剧每日排期（单榜无筛选） */
+function TvmazeView({ onPick }: { onPick: (title: string) => void }) {
+  const query = useQuery({
+    queryKey: ['tvmaze-schedule'],
+    queryFn: ({ signal }) => api.tvmazeSchedule(signal),
+  });
+
+  return (
+    <SimpleListView
+      ariaLabel="欧美剧排期推荐"
+      items={query.data?.items ?? []}
+      isError={query.isError}
+      isLoading={query.isLoading}
+      onPick={onPick}
+    />
   );
 }
 

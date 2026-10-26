@@ -19,8 +19,15 @@ export interface AppSettings {
   yellowFilter: boolean;
   adFilter: boolean;
   doubanEnabled: boolean;
-  /** 首页推荐数据源：豆瓣热门 / Bangumi 每日放送（免 key）/ 影视热榜（60s API） */
-  recommendSource: 'douban' | 'bangumi' | 'hot-list';
+  /** 首页推荐数据源：豆瓣热门 / Bangumi 每日放送（免 key）/ 影视热榜（60s API）/ 豆瓣高分 / B站影视榜 / AniList 动漫趋势 / TVMaze 欧美剧排期 */
+  recommendSource:
+    | 'douban'
+    | 'bangumi'
+    | 'hot-list'
+    | 'douban-top250'
+    | 'bili'
+    | 'anilist'
+    | 'tvmaze';
   /** 用户是否在设置中主动选择过推荐数据源；为 false 时部署者的 DEFAULT_RECOMMEND_SOURCE 默认值可生效 */
   recommendSourceTouched: boolean;
   autoplayNext: boolean;

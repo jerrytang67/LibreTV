@@ -137,7 +137,15 @@ export interface AuthStatusResponse {
   /** 部署者通过 DEFAULT_SUBSCRIPTIONS 环境变量预置的 SourceList 订阅链接（未配置时为空数组） */
   defaultSubscriptions: { url: string; name?: string; refreshDays?: number }[];
   /** 部署者通过 DEFAULT_RECOMMEND_SOURCE 环境变量指定的首页推荐数据源默认值（未配置时为 null） */
-  defaultRecommendSource: 'douban' | 'bangumi' | 'hot-list' | null;
+  defaultRecommendSource:
+    | 'douban'
+    | 'bangumi'
+    | 'hot-list'
+    | 'douban-top250'
+    | 'bili'
+    | 'anilist'
+    | 'tvmaze'
+    | null;
   /** 部署者通过 DEFAULT_IMAGE_MODE 环境变量指定的封面图加载方式默认值（未配置时为 null） */
   defaultImageMode: 'direct' | 'proxy' | null;
 }

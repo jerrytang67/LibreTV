@@ -210,6 +210,21 @@ export const api = {
     return request<DoubanResponse>(`/api/hot-list?${sp.toString()}`, { signal });
   },
 
+  /** 豆瓣高分电影榜（豆瓣电影 Top250，免 key） */
+  doubanTop250: (signal?: AbortSignal) => request<DoubanResponse>('/api/douban-top250', { signal }),
+
+  /** B站影视榜（免 key）：rid=23 影视区 / rid=5 电视剧区 */
+  biliRanking: (rid: number, signal?: AbortSignal) => {
+    const sp = new URLSearchParams({ rid: String(rid) });
+    return request<DoubanResponse>(`/api/bili-ranking?${sp.toString()}`, { signal });
+  },
+
+  /** AniList 动漫趋势榜（GraphQL POST，免 key） */
+  anilistTrending: (signal?: AbortSignal) => request<DoubanResponse>('/api/anilist', { signal }),
+
+  /** TVMaze 每日排期（欧美剧，免 key） */
+  tvmazeSchedule: (signal?: AbortSignal) => request<DoubanResponse>('/api/tvmaze', { signal }),
+
   /** 换源：按标题跨源搜索并取详情，附带接口耗时（测速）；支持 signal 以便关闭弹窗时中止在途请求 */
   detailSpeed: async (id: string, source: SourceConfig, signal?: AbortSignal) => {
     const start = performance.now();

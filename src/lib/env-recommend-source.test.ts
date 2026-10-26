@@ -22,11 +22,15 @@ describe('getEnvRecommendSource', () => {
     }
   });
 
-  it('三个合法取值（大小写不敏感，自动去空白）', () => {
+  it('七个合法取值（大小写不敏感，自动去空白）', () => {
     for (const [raw, expected] of [
       ['douban', 'douban'],
       ['BANGUMI', 'bangumi'],
       [' hot-list ', 'hot-list'],
+      ['douban-top250', 'douban-top250'],
+      ['bili', 'bili'],
+      ['anilist', 'anilist'],
+      ['TVMAZE', 'tvmaze'],
     ] as const) {
       process.env[KEY] = raw;
       expect(getEnvRecommendSource()).toBe(expected);
