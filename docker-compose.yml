@@ -4,12 +4,12 @@ services:
     # 版本管理：镜像 tag 与 package.json 的 version 保持一致
     # - 使用者：不设置 LIBRETV_IMAGE 即拉取 ghcr.io/librespark/libretv:latest（首次部署用 docker compose pull）
     # - 开发者：docker compose up -d --build 会在本地构建并打上同名 tag
-    # - 需要固定版本时设置 LIBRETV_IMAGE=ghcr.io/librespark/libretv:<版本>
+    # - 需要固定版本时设置 LIBRETV_IMAGE=ghcr.io/librespark/libretv:2.0.1
     image: ${LIBRETV_IMAGE:-ghcr.io/librespark/libretv:latest}
     container_name: libretv
     restart: unless-stopped
     ports:
-      - "8080:8080"
+      - "8899:8080"
     # 无状态服务：观看历史在浏览器 IndexedDB、设置在 localStorage，无需挂载卷
     environment:
       # 必填：访问密码（在 .env 中设置，缺失时 compose 启动即报错提醒）
@@ -20,11 +20,11 @@ services:
       # - COOKIE_SECURE=true
       # 可选：预置采集站（JSON 数组），用户端自动出现且默认勾选
       # - DEFAULT_SOURCES=[{"name":"示例源","url":"https://example.com/api.php/provide/vod"}]
+      - 'DEFAULT_SOURCES=[{"name":"光速资源","url":"https://api.guangsuapi.com/api.php/provide/vod"},{"name":"新狼资源","url":"https://api.xinlangapi.com/xinlangapi.php/provide/vod"},{"name":"极速资源","url":"https://jszyapi.com/api.php/provide/vod"}]'
       # 可选：预置直播源（M3U 订阅，JSON 数组），epg 为可选节目单地址
       # - DEFAULT_LIVE_SOURCES=[{"name":"示例直播源","url":"https://example.com/list.m3u","epg":"https://example.com/epg.xml.gz"}]
       # 可选：预置数据源订阅（SourceList JSON 链接，一次下发点播源 + 直播源）
-      # refreshDays 为该订阅的静默刷新周期初始值（1-365 天，缺省 1 天），可省略；用户在面板改过后以面板为准
-      # - DEFAULT_SUBSCRIPTIONS=["https://example.com/sources.json", {"url":"https://example.com/list.json","name":"名称","refreshDays":10}]
+      # - DEFAULT_SUBSCRIPTIONS=["https://example.com/sources.json"]
       # 可选：首页推荐数据源默认值（douban / bangumi / hot-list），仅对未主动选择过的用户生效
       # - DEFAULT_RECOMMEND_SOURCE=douban
       # 可选：自建内网 IPTV 放行（对拉列表、测活、拉流三个阶段同时生效，默认关闭以维持 SSRF 防护）

@@ -11,4 +11,8 @@ vitest-results.json
 .mimosa/
 .zcode/
 .codebuddy/
+.workbuddy/
 generated-images/
+
+# 排查/巡检脚本产出的临时快照（source-check、git-update 等，按日期分目录）
+artifacts/
