@@ -18,7 +18,16 @@ const PlayerShell = dynamic(() => import('@/components/player-shell').then((m) =
 import { EmptyState, LoadingState, Spinner } from '@/components/states';
 import { SwitchSourceModal } from '@/components/switch-source';
 import { SkipMarkPanel } from '@/components/skip-mark-panel';
-import { skipMarkKey, validateSegment, type SkipSegment } from '@/lib/skip-marks';
+import { DanmakuPanel } from '@/components/danmaku-panel';
+import { skipMarkKey, validateSegment, UNKNOWN_TITLE, type SkipSegment } from '@/lib/skip-marks';
+import {
+  cleanDanmakuTitle,
+  densityLimits,
+  shiftDanmaku,
+  type DanmakuItem,
+  type DanmakuStyle,
+} from '@/lib/danmaku';
+import { DanmakuNotConfiguredError, fetchDanmakuComments, searchDanmaku } from '@/lib/danmaku-client';
 import type { PlayerSkipApi } from '@/components/player-shell';
 import { useToast } from '@/components/toast';
 import { enqueueDownload } from '@/components/download-manager';
@@ -35,6 +44,13 @@ import {
   db,
 } from '@/lib/db';
 import { cn } from '@/lib/utils';
+
+/**
+ * 共享的空弹幕数组常量。
+ * 换集/未匹配时返回它而不是 `[]`：每次渲染都 new 一个数组会让下游 useMemo/useEffect
+ * 误判「数据变了」，进而每帧重置引擎。
+ */
+const EMPTY_DANMAKU_ITEMS: DanmakuItem[] = [];
 
 /**
  * 播放页（唯一入口，替代旧版 watch.html → player.html 跳转链）。
@@ -65,6 +81,7 @@ function WatchContent() {
   const [reversed, setReversed] = useState(false);
   const [switchOpen, setSwitchOpen] = useState(false);
   const [skipPanelOpen, setSkipPanelOpen] = useState(false);
+  const [danmakuPanelOpen, setDanmakuPanelOpen] = useState(false);
   // 播放器对外暴露的精确时间读取接口（「记录当前」用），随播放器卸载置空
   const playerApiRef = useRef<PlayerSkipApi | null>(null);
   // 播放框：小屏「跳过标记」抽屉要按它的底边算剩余高度，避免压住画面
@@ -72,7 +89,8 @@ function WatchContent() {
   const [sheetMaxHeight, setSheetMaxHeight] = useState<number | undefined>(undefined);
 
   useEffect(() => {
-    if (!skipPanelOpen) return;
+    // 两个抽屉（跳过标记 / 弹幕）都按同一套规则算高度：小屏都要避开画面
+    if (!skipPanelOpen && !danmakuPanelOpen) return;
     const measure = () => {
       // 桌面端抽屉贴右侧、整屏高，不受播放器位置影响
       if (window.matchMedia('(min-width: 1024px)').matches) {
@@ -97,7 +115,7 @@ function WatchContent() {
       window.removeEventListener('resize', measure);
       window.visualViewport?.removeEventListener('resize', measure);
     };
-  }, [skipPanelOpen]);
+  }, [skipPanelOpen, danmakuPanelOpen]);
 
   const source = resolveSource(store, sourceKey, {
     url: searchParams.get('sourceUrl') || undefined,
@@ -113,7 +131,7 @@ function WatchContent() {
   });
 
   const episodes = useMemo(() => detailQuery.data?.episodes ?? [], [detailQuery.data]);
-  const videoTitle = titleParam || detailQuery.data?.videoInfo?.title || '未知视频';
+  const videoTitle = titleParam || detailQuery.data?.videoInfo?.title || UNKNOWN_TITLE;
 
   // 当前播放地址：优先取剧集列表中的当前集，其次直连 URL 参数
   const currentUrl = useMemo(() => {
@@ -138,6 +156,141 @@ function WatchContent() {
   );
   const skipMark = store.skipMarks[markKey];
   const markedCount = skipMark?.segments.length ?? 0;
+
+  // —— 外挂弹幕 ——
+  // 绑定按「源 + 影片 + 集数」记录：弹幕是每集独立的资源，换集必须重新匹配，
+  // 不能沿用上一集的 items（时间轴连着，但内容与偏移完全不同）。
+  const episodeKey = `${sourceKey}:${vodId}:${currentIndex}`;
+  const danmakuMapping = store.danmakuMappings[episodeKey];
+  const danmakuEpisodeId = danmakuMapping?.episodeId;
+  /**
+   * 已加载的弹幕，**连同它属于哪一集**一起存。
+   *
+   * 只存 items 会有一个真实缺陷：换集时 danmakuEpisodeId 变了、effect 重跑只是发起新请求，
+   * 上一集的几百条弹幕仍留在 state 里，直到新请求 resolve 才被覆盖——这中间会把上一集的
+   * 弹幕（还套着新集的 offset）画到新集上。打上 episodeId 后，下面的渲染期判定可以在
+   * **换集后的第一帧**就返回空数组，不留任何残留窗口。
+   * 同一集的手动「重新加载弹幕」不清空（id 相同），避免画面闪白。
+   */
+  const [danmakuLoaded, setDanmakuLoaded] = useState<{ episodeId: number; items: DanmakuItem[] } | null>(null);
+  // 是否正在拉取本集弹幕：按钮要能区分「加载中」和「一条都没有」，否则用户只会觉得功能坏了
+  const [danmakuLoading, setDanmakuLoading] = useState(false);
+  const [danmakuReloadToken, setDanmakuReloadToken] = useState(0);
+  // 渲染期按归属过滤：这一行是「跨集零残留」的全部保证，不要挪进 effect
+  const danmakuRaw =
+    danmakuLoaded && danmakuLoaded.episodeId === danmakuEpisodeId ? danmakuLoaded.items : EMPTY_DANMAKU_ITEMS;
+  // 弹幕是增强功能：任何失败都只提示一次，绝不阻塞播放。用 ref 持有 toast，
+  // 避免它进依赖数组导致 effect 反复重跑（重新发请求）
+  const toastRef = useRef(toast);
+  toastRef.current = toast;
+
+  // 拉取本集弹幕。只在「已开启 + 已匹配 + 换集/重新加载」时发起：
+  // 偏移校准不重新请求，时间轴由下面的 shiftDanmaku 在本地平移
+  useEffect(() => {
+    if (!store.danmakuEnabled || !danmakuEpisodeId) {
+      setDanmakuLoaded(null);
+      setDanmakuLoading(false);
+      return;
+    }
+    // 闭包里固定本次请求对应的集：请求返回时若已换集，写入的数据也不会被当前渲染采信
+    const episodeId = danmakuEpisodeId;
+    const controller = new AbortController();
+    setDanmakuLoading(true);
+    fetchDanmakuComments(episodeId, controller.signal)
+      .then((result) => {
+        if (!controller.signal.aborted) setDanmakuLoaded({ episodeId, items: result.items });
+      })
+      .catch((err: unknown) => {
+        if (controller.signal.aborted) return;
+        setDanmakuLoaded(null);
+        toastRef.current(err instanceof Error ? err.message : '弹幕加载失败', 'warning');
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setDanmakuLoading(false);
+      });
+    return () => controller.abort();
+  }, [store.danmakuEnabled, danmakuEpisodeId, danmakuReloadToken]);
+
+  // 自动匹配：开启弹幕后本集还没绑定过，就用「清洗后的剧名 + 集数」静默匹配一次。
+  // 每集只尝试一次（autoMatchTriedRef），失败提示过一次就不再打扰观众。
+  const autoMatchTriedRef = useRef<Set<string>>(new Set());
+  // 「没配密钥」是全局状态：整个会话提示一次就够，不能每换一集弹一遍
+  const danmakuConfigWarnedRef = useRef(false);
+  // 「自动匹配没命中」也只提示一次：每换一集都弹一遍会变成噪音
+  const danmakuNoMatchWarnedRef = useRef(false);
+  useEffect(() => {
+    if (!store.danmakuEnabled || !currentUrl) return;
+    if (danmakuMapping) return;
+    // 占位标题（纯直链链接 / 详情还没回来）没有匹配价值，等真实标题到了再试
+    if (!videoTitle || videoTitle === UNKNOWN_TITLE) return;
+    if (autoMatchTriedRef.current.has(episodeKey)) return;
+    autoMatchTriedRef.current.add(episodeKey);
+
+    const controller = new AbortController();
+    searchDanmaku(cleanDanmakuTitle(videoTitle), currentIndex + 1, controller.signal)
+      .then((result) => {
+        if (controller.signal.aborted) return;
+        const picked = result.picked;
+        if (!picked) {
+          // 静默返回是最糟的体验：用户开了弹幕却什么都没发生，会以为功能坏了
+          if (!danmakuNoMatchWarnedRef.current) {
+            danmakuNoMatchWarnedRef.current = true;
+            toastRef.current('未自动匹配到弹幕，可在「弹幕」面板里手动搜索', 'warning');
+          }
+          return;
+        }
+        useAppStore.getState().setDanmakuMapping(episodeKey, {
+          episodeId: picked.episodeId,
+          animeTitle: picked.animeTitle,
+          episodeTitle: picked.episodeTitle,
+          offsetSeconds: 0,
+          matchedAt: Date.now(),
+          auto: true,
+        });
+      })
+      .catch((err: unknown) => {
+        if (controller.signal.aborted) return;
+        if (err instanceof DanmakuNotConfiguredError) {
+          if (danmakuConfigWarnedRef.current) return;
+          danmakuConfigWarnedRef.current = true;
+        }
+        toastRef.current(err instanceof Error ? err.message : '弹幕自动匹配失败', 'warning');
+      });
+    return () => controller.abort();
+  }, [store.danmakuEnabled, danmakuMapping, currentUrl, videoTitle, episodeKey, currentIndex]);
+
+  // 偏移只在这一层施加：引擎拿到的永远是「已经平移好的时间轴」，
+  // 拖动偏移时不需要重新请求，也不需要重建引擎
+  const danmakuItems = useMemo(
+    () =>
+      store.danmakuEnabled && danmakuRaw.length > 0
+        ? shiftDanmaku(danmakuRaw, danmakuMapping?.offsetSeconds ?? 0)
+        : EMPTY_DANMAKU_ITEMS,
+    [store.danmakuEnabled, danmakuRaw, danmakuMapping?.offsetSeconds]
+  );
+
+  const danmakuOptions = useMemo<DanmakuStyle>(
+    () => ({
+      opacity: store.danmakuOpacity,
+      fontSize: store.danmakuFontSize,
+      speed: store.danmakuSpeed,
+      areaRatio: store.danmakuArea,
+      showScroll: store.danmakuShowScroll,
+      showTop: store.danmakuShowTop,
+      showBottom: store.danmakuShowBottom,
+      ...densityLimits(store.danmakuDensity),
+    }),
+    [
+      store.danmakuOpacity,
+      store.danmakuFontSize,
+      store.danmakuSpeed,
+      store.danmakuArea,
+      store.danmakuShowScroll,
+      store.danmakuShowTop,
+      store.danmakuShowBottom,
+      store.danmakuDensity,
+    ]
+  );
 
   // 中段两步态的起点：页面层持有，面板按钮与 Shift+S/E 共用同一份状态
   const [pendingStart, setPendingStart] = useState<number | null>(null);
@@ -250,6 +403,18 @@ function WatchContent() {
     return () => document.removeEventListener('keydown', handler);
   }, [currentIndex, episodes.length, goEpisode]);
 
+  // 按钮文案就是功能状态：关闭 / 加载中 / 已加载条数 / 已匹配但 0 条 / 未匹配。
+  // 默认关闭却不显示状态，是「播放时看不到弹幕」最常见的误解来源。
+  const danmakuButtonLabel = !store.danmakuEnabled
+    ? '弹幕 · 关'
+    : danmakuLoading
+      ? '弹幕 · 加载中'
+      : danmakuItems.length > 0
+        ? `弹幕 (${danmakuItems.length})`
+        : danmakuMapping
+          ? '弹幕 · 0 条'
+          : '弹幕 · 未匹配';
+
   const orderedEpisodes = reversed ? [...episodes].map((_, i) => episodes.length - 1 - i) : episodes.map((_, i) => i);
 
   if (!verified) {
@@ -327,7 +492,7 @@ function WatchContent() {
                   onPendingStart={setPendingStart}
                   onPlayerApi={(api) => { playerApiRef.current = api; }}
                   onRecordSegment={handleRecordSegment}
-                  episodeKey={`${sourceKey}:${vodId}:${currentIndex}`}
+                  episodeKey={episodeKey}
                   nextUrl={currentIndex + 1 < episodes.length ? episodes[currentIndex + 1] : undefined}
                   nextEpisodeKey={currentIndex + 1 < episodes.length ? `${sourceKey}:${vodId}:${currentIndex + 1}` : undefined}
                   getRestorePosition={getRestorePosition}
@@ -345,6 +510,9 @@ function WatchContent() {
                       [qualityKey(sourceKey, vodId)]: { height, from: 'play', timestamp: Date.now() },
                     });
                   }}
+                  danmakuItems={danmakuItems}
+                  danmakuOptions={danmakuOptions}
+                  danmakuVisible={store.danmakuEnabled && danmakuItems.length > 0}
                 />
               ) : (
                 <div className="w-full h-full flex items-center justify-center">
@@ -391,6 +559,39 @@ function WatchContent() {
                   <span className="ml-1 inline-block size-1.5 rounded-full bg-faint" aria-label="本剧跳过已关闭" />
                 )}
               </button>
+              <button
+                className={cn('btn-ghost btn-sm', danmakuPanelOpen && 'bg-chip text-content')}
+                aria-expanded={danmakuPanelOpen}
+                aria-haspopup="dialog"
+                onClick={() => {
+                  // 一次点击就完成「打开面板 + 开启功能」：默认关闭时若只打开面板，
+                  // 用户看到的仍是一个没有弹幕的进度条，会以为功能没生效
+                  if (danmakuPanelOpen) {
+                    setDanmakuPanelOpen(false);
+                    return;
+                  }
+                  if (!store.danmakuEnabled) store.updateSettings({ danmakuEnabled: true });
+                  setDanmakuPanelOpen(true);
+                }}
+                title={
+                  !store.danmakuEnabled
+                    ? '外挂弹幕当前关闭，点击开启并打开面板'
+                    : danmakuMapping
+                      ? `已绑定「${danmakuMapping.animeTitle}${danmakuMapping.episodeTitle ? ` · ${danmakuMapping.episodeTitle}` : ''}」，点击调整匹配与偏移`
+                      : '未匹配到分集，点击打开面板手动搜索'
+                }
+              >
+                {danmakuButtonLabel}
+                {store.danmakuEnabled && (
+                  <span
+                    className={cn(
+                      'ml-1 inline-block size-1.5 rounded-full',
+                      danmakuItems.length > 0 ? 'bg-accent' : 'bg-faint'
+                    )}
+                    aria-label={danmakuItems.length > 0 ? '本集已有弹幕' : '本集暂无弹幕'}
+                  />
+                )}
+              </button>
               <label className="flex items-center gap-1.5 text-xs text-muted ml-auto cursor-pointer">
                 <input
                   type="checkbox"
@@ -420,6 +621,18 @@ function WatchContent() {
                   isPaused: () => api.isPaused(),
                 };
               }}
+            />
+
+            <DanmakuPanel
+              open={danmakuPanelOpen}
+              onClose={() => setDanmakuPanelOpen(false)}
+              episodeKey={episodeKey}
+              mapping={danmakuMapping}
+              queryTitle={videoTitle}
+              episodeNumber={currentIndex + 1}
+              count={danmakuItems.length}
+              onReload={() => setDanmakuReloadToken((token) => token + 1)}
+              mobileMaxHeight={sheetMaxHeight}
             />
           </div>
 

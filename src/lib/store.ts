@@ -4,6 +4,8 @@ import { create } from 'zustand';
 import { createJSONStorage, persist } from 'zustand/middleware';
 import type { QualityEntry, SourceConfig, LiveSourceConfig, SourceSearchOutcome } from './types';
 import { migrateSkipMarks, type SkipMark, type SkipSegment } from './skip-marks';
+import { normalizeDanmakuDensity, type DanmakuDensity } from './danmaku';
+import { migrateDanmakuMappings, type DanmakuMapping } from './danmaku';
 import { isQualityEntryFresh, mergeQualityEntries, qualityKey } from './quality';
 import { clearLiveProbeResultsDb, loadLiveProbeResults, saveLiveProbeResults } from './db';
 import { PERSIST_KEY, createThrottledStorage } from './persist-storage';
@@ -42,6 +44,29 @@ export interface AppSettings {
   /** 用户是否在设置中主动选择过封面图加载方式；为 false 时部署者的 DEFAULT_IMAGE_MODE 默认值可生效 */
   imageProxyModeTouched: boolean;
   customImageProxy: string;
+  /**
+   * 外挂弹幕总开关。默认关闭：数据源需要用户自备密钥（或部署者统一配置），
+   * 且首次播放要做一次匹配，默认打开会让「没配密钥」的用户一进来就看到报错。
+   */
+  danmakuEnabled: boolean;
+  /** 弹幕不透明度 0.1 ~ 1 */
+  danmakuOpacity: number;
+  /** 弹幕字号（px） */
+  danmakuFontSize: number;
+  /** 弹幕滚动速度倍率 0.5 ~ 2 */
+  danmakuSpeed: number;
+  /** 弹幕占画面高度的比例：0.25 / 0.5 / 0.75 / 1 */
+  danmakuArea: number;
+  /** 弹幕密度档位（少/中/多），换算成引擎的轨道数与同屏条数上限 */
+  danmakuDensity: DanmakuDensity;
+  danmakuShowScroll: boolean;
+  danmakuShowTop: boolean;
+  danmakuShowBottom: boolean;
+  /**
+   * 弹幕绑定（按集）：key 为 `${sourceKey}:${vodId}:${episodeIndex}`，与播放页 episodeKey 一致。
+   * 与跳过片段不同，弹幕是每集独立资源，不能按剧名共享。
+   */
+  danmakuMappings: Record<string, DanmakuMapping>;
 }
 
 /** 一次订阅同步导入的数量（点播 / 直播），用于列表内展示同步结果 */
@@ -297,6 +322,10 @@ interface AppState extends AppSettings {
   clearSkipMark: (key: string) => void;
   /** 清除全部跳过片段（设置面板的「清除全部」入口） */
   clearAllSkipMarks: () => void;
+  /** 写入/覆盖一集的弹幕绑定；传 null 表示解除绑定（删键） */
+  setDanmakuMapping: (key: string, mapping: DanmakuMapping | null) => void;
+  /** 清除全部弹幕绑定（设置面板的「清除全部弹幕匹配」入口） */
+  clearAllDanmakuMappings: () => void;
   markEnvSubsSeen: (urls: string[]) => void;
   updateSettings: (patch: Partial<Omit<AppSettings, 'customAPIs' | 'selectedKeys'>>) => void;
 }
@@ -351,6 +380,17 @@ export const useAppStore = create<AppState>()(
       imageProxyMode: 'direct',
       imageProxyModeTouched: false,
       customImageProxy: '',
+      // 外挂弹幕默认关闭：开关打开才会去拉数据源，避免默认配置下产生无效请求
+      danmakuEnabled: false,
+      danmakuOpacity: 0.9,
+      danmakuFontSize: 20,
+      danmakuSpeed: 1,
+      danmakuArea: 1,
+      danmakuDensity: 'medium',
+      danmakuShowScroll: true,
+      danmakuShowTop: true,
+      danmakuShowBottom: true,
+      danmakuMappings: {},
 
       addCustomApi: (api) => {
         const list = get().customAPIs;
@@ -820,6 +860,21 @@ export const useAppStore = create<AppState>()(
 
       clearAllSkipMarks: () => set({ skipMarks: {} }),
 
+      setDanmakuMapping: (key, mapping) => {
+        const mappings = get().danmakuMappings;
+        if (!mapping) {
+          // 解除绑定要真的删键：持久化快照里留空壳会让「已匹配集数」统计失真
+          if (!mappings[key]) return;
+          const rest = { ...mappings };
+          delete rest[key];
+          set({ danmakuMappings: rest });
+          return;
+        }
+        set({ danmakuMappings: { ...mappings, [key]: mapping } });
+      },
+
+      clearAllDanmakuMappings: () => set({ danmakuMappings: {} }),
+
       updateSettings: (patch) => {
         // 用户主动修改推荐数据源 / 封面图加载方式时打上「已选择」标记：此后部署者的
         // DEFAULT_RECOMMEND_SOURCE / DEFAULT_IMAGE_MODE 默认值不再覆盖该用户的选择
@@ -860,8 +915,10 @@ export const useAppStore = create<AppState>()(
       // v7：片尾结束也并入同一开关（不再单独提供 autoSkipOutro）。
       // v8：订阅新增 refreshDays / failStreak——两者都缺省即「纯手动 + 无失败记录」，
       //     与旧行为完全一致，因此无需改写存量数据，仅借版本号让 migrate 跑一遍。
+      // v9：新增外挂弹幕（开关/样式/按集绑定）。老快照缺字段时补默认值，
+      //     已有设置一律保留——弹幕默认关闭，不会改变任何老用户的既有行为。
       // 此前未声明 version 的存量数据会被视为 v0 并走 migrate 补齐。
-      version: 8,
+      version: 9,
       migrate: (persisted, version) => {
         const state = { ...((persisted ?? {}) as Partial<AppState>) };
         if (!Array.isArray(state.liveRecent)) state.liveRecent = [];
@@ -897,6 +954,32 @@ export const useAppStore = create<AppState>()(
         for (const stale of ['autoSkipIntro', 'autoSkipOpening', 'autoSkipMiddle', 'autoSkipOutro']) {
           delete (state as unknown as Record<string, unknown>)[stale];
         }
+
+        // v9 外挂弹幕：老快照完全没有这些字段，逐个显式补默认值。
+        // 布尔字段必须判 typeof === 'boolean'——`state.danmakuEnabled ?? false` 之类写法
+        // 会把持久化进去的「false」和「字段缺失」混为一谈，日后想改默认值就改不动了。
+        if (typeof state.danmakuEnabled !== 'boolean') state.danmakuEnabled = false;
+        // 密度是新增字段：旧快照没有、或被手改成非法值时统一回落到「中」
+        state.danmakuDensity = normalizeDanmakuDensity(state.danmakuDensity);
+        if (typeof state.danmakuOpacity !== 'number' || !Number.isFinite(state.danmakuOpacity)) {
+          state.danmakuOpacity = 0.9;
+        }
+        if (typeof state.danmakuFontSize !== 'number' || !Number.isFinite(state.danmakuFontSize)) {
+          state.danmakuFontSize = 20;
+        }
+        if (typeof state.danmakuSpeed !== 'number' || !Number.isFinite(state.danmakuSpeed)) {
+          state.danmakuSpeed = 1;
+        }
+        if (typeof state.danmakuArea !== 'number' || !Number.isFinite(state.danmakuArea)) {
+          state.danmakuArea = 1;
+        }
+        if (typeof state.danmakuShowScroll !== 'boolean') state.danmakuShowScroll = true;
+        if (typeof state.danmakuShowTop !== 'boolean') state.danmakuShowTop = true;
+        if (typeof state.danmakuShowBottom !== 'boolean') state.danmakuShowBottom = true;
+        // 绑定表逐条校验（脏条目会让请求带上 NaN 的 episodeId），损坏项在内部丢弃
+        state.danmakuMappings = migrateDanmakuMappings(
+          (state as unknown as { danmakuMappings?: unknown }).danmakuMappings
+        );
 
         if (version < 2) {
           state.liveSubscriptions = state.liveSubscriptions.map((s) => {
@@ -944,6 +1027,16 @@ export const useAppStore = create<AppState>()(
         imageProxyMode: s.imageProxyMode,
         imageProxyModeTouched: s.imageProxyModeTouched,
         customImageProxy: s.customImageProxy,
+        danmakuEnabled: s.danmakuEnabled,
+        danmakuOpacity: s.danmakuOpacity,
+        danmakuFontSize: s.danmakuFontSize,
+        danmakuSpeed: s.danmakuSpeed,
+        danmakuArea: s.danmakuArea,
+        danmakuDensity: s.danmakuDensity,
+        danmakuShowScroll: s.danmakuShowScroll,
+        danmakuShowTop: s.danmakuShowTop,
+        danmakuShowBottom: s.danmakuShowBottom,
+        danmakuMappings: s.danmakuMappings,
       }),
       // 同步 storage 会在模块加载时立即 rehydrate（早于 React hydration），
       // 一旦首屏渲染依赖持久化状态就会与 SSR 输出不一致。

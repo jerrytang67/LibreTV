@@ -27,6 +27,20 @@ import { formatRelativeTime, hostnameOf, validateSourceUrl, cn } from '@/lib/uti
 import { exportConfig, importConfig } from '@/lib/db';
 import { PERSIST_KEY } from '@/lib/persist-storage';
 import { copyToClipboard } from '@/lib/clipboard';
+import {
+  DANMAKU_AREA_OPTIONS,
+  DANMAKU_DENSITY_OPTIONS,
+  DANMAKU_FONT_SIZE_OPTIONS,
+  DANMAKU_OPACITY_OPTIONS,
+  DANMAKU_SPEED_OPTIONS,
+  normalizeDanmakuDensity,
+} from '@/lib/danmaku';
+import {
+  DANDANPLAY_DOC_URL,
+  fetchDanmakuStatus,
+  loadDanmakuCredentials,
+  saveDanmakuCredentials,
+} from '@/lib/danmaku-client';
 import { useAuth } from './auth';
 import { api } from '@/lib/client-api';
 import { AUTO_REFRESH_MAX_FAIL_STREAK, syncSourceSubscription } from '@/lib/subscription-sync';
@@ -557,6 +571,11 @@ function VodSourceRow({
 
 // —— 偏好设置面板 ——
 
+/** 区域用分数标签展示：1/3 显示成「33%」既不准确也不直观 */
+function areaLabel(v: number): string {
+  return DANMAKU_AREA_OPTIONS.find((o) => Math.abs(o.value - v) < 0.01)?.label ?? `${Math.round(v * 100)}%`;
+}
+
 function PlaybackPanel() {
   const store = useAppStore();
   const { toast } = useToast();
@@ -612,8 +631,216 @@ function PlaybackPanel() {
         }}
       />
 
+      <DanmakuSettingsSection />
+
       <VideoCachePanel />
     </section>
+  );
+}
+
+/**
+ * 外挂弹幕设置区块（播放与过滤面板内）。
+ *
+ * 分三层：
+ *   1. 总开关 + 显示开关（只影响播放，不涉及数据源）；
+ *   2. 样式（透明度/字号/速度/区域）——取值集合与 Canvas 引擎共用同一份常量；
+ *   3. 凭据与清理。凭据写 localStorage 独立 key 而不进 zustand，是因为「导出配置」
+ *      会把整个快照序列化下载，密钥进去等于随手传播给别人。
+ */
+function DanmakuSettingsSection() {
+  const store = useAppStore();
+  const { toast } = useToast();
+  const [clearOpen, setClearOpen] = useState(false);
+  const [envConfigured, setEnvConfigured] = useState(false);
+  // 自建兼容上游（danmu_api 等）不需要密钥，提示文案必须区分，否则用户会去找一个根本不存在的输入框
+  const [selfHosted, setSelfHosted] = useState(false);
+  const [appId, setAppId] = useState('');
+  const [appSecret, setAppSecret] = useState('');
+  const mappingCount = Object.keys(store.danmakuMappings).length;
+
+  useEffect(() => {
+    const saved = loadDanmakuCredentials();
+    setAppId(saved.appId);
+    setAppSecret(saved.appSecret);
+    // 部署者配过环境变量时，用户就不用再填一遍；接口失败不提示（离线也能用已保存的凭据）
+    let alive = true;
+    fetchDanmakuStatus()
+      .then((status) => {
+        if (alive) {
+          setEnvConfigured(status.envConfigured);
+          setSelfHosted(Boolean(status.selfHosted));
+        }
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  const writeCredentials = (patch: { appId?: string; appSecret?: string }) => {
+    const next = { appId: patch.appId ?? appId, appSecret: patch.appSecret ?? appSecret };
+    setAppId(next.appId);
+    setAppSecret(next.appSecret);
+    saveDanmakuCredentials(next);
+  };
+
+  return (
+    <div className="space-y-3 pt-3 mt-3 border-t border-line">
+      <SectionTitle
+        title="弹幕"
+        hint={
+          selfHosted
+            ? '使用部署者自建的弹幕服务（无需密钥）'
+            : envConfigured
+              ? '已由部署者配置弹弹play 密钥'
+              : '数据源：弹弹play 开放平台'
+        }
+      />
+
+      <ToggleRow
+        label="外挂弹幕"
+        description="播放时叠加弹弹play 的弹幕（需要匹配到具体分集）；关闭后不请求任何弹幕接口"
+        checked={store.danmakuEnabled}
+        onChange={(v) => store.updateSettings({ danmakuEnabled: v })}
+      />
+
+      <div className="space-y-1.5 pl-0.5">
+        <div className="flex items-center justify-between gap-3">
+          <span className="text-xs text-muted">滚动弹幕</span>
+          <Switch
+            checked={store.danmakuShowScroll}
+            label="滚动弹幕"
+            onChange={(v) => store.updateSettings({ danmakuShowScroll: v })}
+          />
+        </div>
+        <div className="flex items-center justify-between gap-3">
+          <span className="text-xs text-muted">顶部固定</span>
+          <Switch
+            checked={store.danmakuShowTop}
+            label="顶部固定弹幕"
+            onChange={(v) => store.updateSettings({ danmakuShowTop: v })}
+          />
+        </div>
+        <div className="flex items-center justify-between gap-3">
+          <span className="text-xs text-muted">底部固定</span>
+          <Switch
+            checked={store.danmakuShowBottom}
+            label="底部固定弹幕"
+            onChange={(v) => store.updateSettings({ danmakuShowBottom: v })}
+          />
+        </div>
+      </div>
+
+      <SelectRow
+        label="不透明度"
+        value={String(store.danmakuOpacity)}
+        description={`当前 ${Math.round(store.danmakuOpacity * 100)}%：过低会看不清，过高会盖住画面细节`}
+        options={DANMAKU_OPACITY_OPTIONS.map((v) => ({ value: String(v), label: `${Math.round(v * 100)}%` }))}
+        onChange={(v) => store.updateSettings({ danmakuOpacity: Number(v) })}
+      />
+
+      <SelectRow
+        label="字号"
+        value={String(store.danmakuFontSize)}
+        description={`当前 ${store.danmakuFontSize}px`}
+        options={DANMAKU_FONT_SIZE_OPTIONS.map((v) => ({ value: String(v), label: `${v}px` }))}
+        onChange={(v) => store.updateSettings({ danmakuFontSize: Number(v) })}
+      />
+
+      <SelectRow
+        label="滚动速度"
+        value={String(store.danmakuSpeed)}
+        description={`当前 ${store.danmakuSpeed}×：越快在同一屏塞下越多弹幕`}
+        options={DANMAKU_SPEED_OPTIONS.map((v) => ({ value: String(v), label: `${v}×` }))}
+        onChange={(v) => store.updateSettings({ danmakuSpeed: Number(v) })}
+      />
+
+      <SelectRow
+        label="弹幕量"
+        value={store.danmakuDensity}
+        description="同时控制轨道数与同屏条数；嫌刷屏就选「少」"
+        options={DANMAKU_DENSITY_OPTIONS.map((o) => ({ value: o.value, label: o.label }))}
+        onChange={(v) => store.updateSettings({ danmakuDensity: normalizeDanmakuDensity(v) })}
+      />
+
+      <SelectRow
+        label="显示区域"
+        value={String(store.danmakuArea)}
+        description={`弹幕最多占画面高度的 ${areaLabel(store.danmakuArea)}`}
+        options={DANMAKU_AREA_OPTIONS.map((o) => ({ value: String(o.value), label: o.label }))}
+        onChange={(v) => store.updateSettings({ danmakuArea: Number(v) })}
+      />
+
+      <div className="rounded-lg border border-line/70 px-3 py-2.5">
+        <div className="flex items-center justify-between gap-2">
+          <span className="text-sm text-content">弹弹play 凭据</span>
+          {envConfigured ? (
+            <span className="text-[10px] px-1.5 py-0.5 rounded bg-success/15 text-success">已由部署者配置</span>
+          ) : (
+            <a
+              className="text-[11px] text-accent hover:underline"
+              href={DANDANPLAY_DOC_URL}
+              target="_blank"
+              rel="noreferrer"
+            >
+              如何申请
+            </a>
+          )}
+        </div>
+        <p className="mt-1 text-[11px] leading-relaxed text-faint">
+          仅保存在本机浏览器；若部署者已通过环境变量配置则无需填写。凭据只用于服务端计算签名，不会下发到页面里。
+        </p>
+        <div className="mt-2 space-y-1.5">
+          <input
+            className="input w-full !py-1.5 text-xs"
+            aria-label="弹弹play AppId"
+            placeholder="AppId"
+            autoComplete="off"
+            spellCheck={false}
+            value={appId}
+            onChange={(e) => writeCredentials({ appId: e.target.value })}
+          />
+          <input
+            className="input w-full !py-1.5 text-xs"
+            aria-label="弹弹play AppSecret"
+            placeholder="AppSecret"
+            type="password"
+            autoComplete="off"
+            spellCheck={false}
+            value={appSecret}
+            onChange={(e) => writeCredentials({ appSecret: e.target.value })}
+          />
+        </div>
+      </div>
+
+      {mappingCount > 0 && (
+        <div className="flex items-center justify-between gap-3">
+          <div className="min-w-0">
+            <div className="text-sm text-content">弹幕匹配记录</div>
+            <div className="text-xs text-faint">
+              已绑定 {mappingCount} 集；在播放页「弹幕」中匹配与校准偏移
+            </div>
+          </div>
+          <button className="btn-ghost btn-sm shrink-0" onClick={() => setClearOpen(true)}>
+            清除全部
+          </button>
+        </div>
+      )}
+
+      <ConfirmDialog
+        open={clearOpen}
+        danger
+        title="清除全部弹幕匹配？"
+        message={`将删除已记录的 ${mappingCount} 集弹幕绑定与偏移，之后播放会重新按标题自动匹配。`}
+        confirmLabel="清除全部"
+        onCancel={() => setClearOpen(false)}
+        onConfirm={() => {
+          store.clearAllDanmakuMappings();
+          setClearOpen(false);
+          toast('已清除全部弹幕匹配', 'success');
+        }}
+      />
+    </div>
   );
 }
 

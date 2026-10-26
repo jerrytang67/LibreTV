@@ -4,12 +4,14 @@ services:
     # 版本管理：镜像 tag 与 package.json 的 version 保持一致
     # - 使用者：不设置 LIBRETV_IMAGE 即拉取 ghcr.io/librespark/libretv:latest（首次部署用 docker compose pull）
     # - 开发者：docker compose up -d --build 会在本地构建并打上同名 tag
-    # - 需要固定版本时设置 LIBRETV_IMAGE=ghcr.io/librespark/libretv:2.0.1
+    # - 需要固定版本时设置 LIBRETV_IMAGE=ghcr.io/librespark/libretv:<版本>
     image: ${LIBRETV_IMAGE:-ghcr.io/librespark/libretv:latest}
-    container_name: libretv
+    # 容器名与宿主端口可覆盖：同一台机器上并行跑多个构建（如本地自测 vs 正式部署）时，
+    # 保持默认值即为标准单实例部署，显式赋值即可避免与既有实例撞名
+    container_name: ${LIBRETV_CONTAINER_NAME:-libretv}
     restart: unless-stopped
     ports:
-      - "8899:8080"
+      - "${LIBRETV_PORT:-8080}:8080"
     # 无状态服务：观看历史在浏览器 IndexedDB、设置在 localStorage，无需挂载卷
     environment:
       # 必填：访问密码（在 .env 中设置，缺失时 compose 启动即报错提醒）
@@ -18,15 +20,16 @@ services:
       # - PROXY_SECRET=your-secret
       # 可选：Cookie Secure 策略覆盖（true=强制开启 / false=强制关闭；不设置时按请求协议自动推导，HTTP 部署无需配置）
       # - COOKIE_SECURE=true
-      # 可选：预置采集站（JSON 数组），用户端自动出现且默认勾选
-      # - DEFAULT_SOURCES=[{"name":"示例源","url":"https://example.com/api.php/provide/vod"}]
-      - 'DEFAULT_SOURCES=[{"name":"光速资源","url":"https://api.guangsuapi.com/api.php/provide/vod"},{"name":"新狼资源","url":"https://api.xinlangapi.com/xinlangapi.php/provide/vod"},{"name":"极速资源","url":"https://jszyapi.com/api.php/provide/vod"}]'
-      # 可选：预置直播源（M3U 订阅，JSON 数组），epg 为可选节目单地址
-      # - DEFAULT_LIVE_SOURCES=[{"name":"示例直播源","url":"https://example.com/list.m3u","epg":"https://example.com/epg.xml.gz"}]
-      # 可选：预置数据源订阅（SourceList JSON 链接，一次下发点播源 + 直播源）
-      # - DEFAULT_SUBSCRIPTIONS=["https://example.com/sources.json"]
-      # 可选：首页推荐数据源默认值（douban / bangumi / hot-list），仅对未主动选择过的用户生效
-      # - DEFAULT_RECOMMEND_SOURCE=douban
+      # 预置采集站（JSON 数组）：用户端自动出现且默认勾选。留空则不预置
+      # 格式示例：DEFAULT_SOURCES='[{"name":"示例源","url":"https://example.com/api.php/provide/vod"}]'
+      - DEFAULT_SOURCES=${DEFAULT_SOURCES:-}
+      # 预置直播源（M3U 订阅，JSON 数组），epg 为可选节目单地址
+      - DEFAULT_LIVE_SOURCES=${DEFAULT_LIVE_SOURCES:-}
+      # 预置数据源订阅（SourceList JSON 链接，一次下发点播源 + 直播源）
+      # refreshDays 为该订阅的静默刷新周期初始值（1-365 天，缺省 1 天），可省略；用户在面板改过后以面板为准
+      - DEFAULT_SUBSCRIPTIONS=${DEFAULT_SUBSCRIPTIONS:-}
+      # 首页推荐数据源默认值（douban / bangumi / hot-list），仅对未主动选择过的用户生效
+      - DEFAULT_RECOMMEND_SOURCE=${DEFAULT_RECOMMEND_SOURCE:-}
       # 可选：自建内网 IPTV 放行（对拉列表、测活、拉流三个阶段同时生效，默认关闭以维持 SSRF 防护）
       # - LIVE_ALLOW_PRIVATE=1
       # 可选：代理上游请求超时（毫秒）与重试次数
@@ -40,3 +43,25 @@ services:
       # - USER_AGENT=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36
       # 可选：影视榜单推荐源（60s API）实例地址，官方公共实例有限流
       # - 60S_API_BASE=https://60s.crystelf.top
+      # 可选：外挂弹幕（弹弹play 开放平台）凭据。留空时观众可在「设置 → 播放与过滤 → 弹幕」自填
+      # 注意：必须显式透传，compose 不会把 .env 里的变量自动塞进容器
+      - DANDANPLAY_APP_ID=${DANDANPLAY_APP_ID:-}
+      - DANDANPLAY_APP_SECRET=${DANDANPLAY_APP_SECRET:-}
+      # 可选：自建反代时覆盖弹幕上游地址（留空则用代码默认 https://api.dandanplay.net）
+      - DANDANPLAY_API_BASE=${DANDANPLAY_API_BASE:-}
+
+  # 可选：自建弹幕服务（免注册方案）
+  # danmu_api 实现了与弹弹play 相同的 /api/v2/* 契约，聚合 B站/爱奇艺/腾讯/优酷/芒果等来源，
+  # 不需要 AppId 与签名。启用方式：.env 里把 DANDANPLAY_API_BASE 指向它，例如
+  #   DANDANPLAY_API_BASE=http://danmu-api:9321/<DANMU_API_TOKEN>
+  # 不启用（不写 DANDANPLAY_API_BASE）时本服务空转，不影响主站。
+  danmu-api:
+    image: logvar/danmu-api:latest
+    container_name: ${DANMU_API_CONTAINER_NAME:-libretv-danmu-api}
+    restart: unless-stopped
+    environment:
+      # 访问令牌：非默认值时必须写进 URL 路径（见上面的 DANDANPLAY_API_BASE 示例）
+      - TOKEN=${DANMU_API_TOKEN:-87654321}
+    ports:
+      # 仅为排查方便暴露到宿主；主站走容器内网 http://danmu-api:9321，不依赖这个映射
+      - "${DANMU_API_PORT:-9322}:9321"

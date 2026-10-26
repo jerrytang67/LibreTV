@@ -14,6 +14,9 @@ tsconfig.tsbuildinfo
 .env*.local
 *.log
 
+# AI 工具产物（本机会话记忆，与构建无关）
+.workbuddy
+
 # 文档与编排文件（不参与镜像构建）
 Dockerfile
 docker-compose.yml
